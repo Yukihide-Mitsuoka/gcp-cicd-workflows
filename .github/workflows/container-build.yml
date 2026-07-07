@@ -1,0 +1,87 @@
+# Reusable: build a container with full BuildKit layer caching (gha backend) and push it
+# to Artifact Registry via keyless OIDC auth. Outputs the immutable digest — deploy that,
+# never a mutable tag.
+#
+# Caller job needs: permissions: { contents: read, id-token: write }
+name: container-build
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Full image name WITHOUT tag (e.g. asia-northeast1-docker.pkg.dev/proj/repo/app)"
+        required: true
+        type: string
+      context:
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        required: false
+        type: string
+        default: "Dockerfile"
+      push:
+        description: "Push to the registry (false = build+cache only, e.g. PR builds)"
+        required: false
+        type: boolean
+        default: true
+      wif_provider:
+        required: true
+        type: string
+      service_account:
+        required: true
+        type: string
+    outputs:
+      digest:
+        description: "Image digest (sha256:...) of the built image"
+        value: ${{ jobs.build.outputs.digest }}
+      image:
+        description: "Full pinned reference: <image>@<digest>"
+        value: ${{ jobs.build.outputs.image }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image: ${{ inputs.image }}@${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        id: auth
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider }}
+          service_account: ${{ inputs.service_account }}
+          token_format: access_token
+
+      - name: Derive registry host from image
+        id: registry
+        run: echo "host=${IMAGE%%/*}" >> "$GITHUB_OUTPUT"
+        env:
+          IMAGE: ${{ inputs.image }}
+
+      - uses: docker/login-action@v3
+        if: inputs.push
+        with:
+          registry: ${{ steps.registry.outputs.host }}
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push (gha layer cache)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: ${{ inputs.push }}
+          tags: |
+            ${{ inputs.image }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false

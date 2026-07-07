@@ -1,0 +1,57 @@
+# Reusable: terraform apply gated by a GitHub environment. Configure the environment in
+# the CALLER repo (Settings > Environments) with Required reviewers — the job pauses
+# there until a human approves (the manual-approval flow).
+#
+# Caller job needs: permissions: { contents: read, id-token: write }
+name: tf-apply
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Directory of the terraform root config"
+        required: true
+        type: string
+      environment:
+        description: "GitHub environment name that carries the approval gate (e.g. production)"
+        required: true
+        type: string
+      wif_provider:
+        required: true
+        type: string
+      service_account:
+        required: true
+        type: string
+      terraform_version:
+        required: false
+        type: string
+        default: "latest"
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider }}
+          service_account: ${{ inputs.service_account }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: terraform init -input=false
+
+      - name: terraform apply
+        run: terraform apply -input=false -auto-approve -no-color

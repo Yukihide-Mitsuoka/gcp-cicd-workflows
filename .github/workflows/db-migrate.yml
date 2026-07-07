@@ -1,0 +1,91 @@
+# Reusable: run a DB migration as a Cloud Run job and, if it fails, execute the
+# rollback command automatically. The migration runs in YOUR app image (it has the
+# migration tool and code); this workflow only orchestrates.
+#
+# Caller job needs: permissions: { contents: read, id-token: write }
+name: db-migrate
+
+on:
+  workflow_call:
+    inputs:
+      project_id:
+        required: true
+        type: string
+      region:
+        required: true
+        type: string
+      image:
+        description: "Image containing the migration tool — use the digest-pinned build output"
+        required: true
+        type: string
+      migrate_args:
+        description: "Comma-separated args for the migration (e.g. 'alembic,upgrade,head')"
+        required: true
+        type: string
+      rollback_args:
+        description: "Comma-separated args to revert (e.g. 'alembic,downgrade,-1'). Empty = no auto-rollback"
+        required: false
+        type: string
+        default: ""
+      job_name:
+        required: false
+        type: string
+        default: "db-migrate"
+      timeout:
+        description: "Per-execution timeout (Cloud Run jobs format, e.g. 10m)"
+        required: false
+        type: string
+        default: "10m"
+      wif_provider:
+        required: true
+        type: string
+      service_account:
+        required: true
+        type: string
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider }}
+          service_account: ${{ inputs.service_account }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ inputs.project_id }}
+
+      - name: Deploy migration job definition
+        run: |
+          set -eu
+          gcloud run jobs deploy "${{ inputs.job_name }}" \
+            --region "${{ inputs.region }}" \
+            --image "${{ inputs.image }}" \
+            --args "${{ inputs.migrate_args }}" \
+            --task-timeout "${{ inputs.timeout }}" \
+            --max-retries 0
+
+      - name: Execute migration (wait for completion)
+        id: migrate
+        run: |
+          set -eu
+          gcloud run jobs execute "${{ inputs.job_name }}" \
+            --region "${{ inputs.region }}" \
+            --wait
+
+      - name: Auto-rollback on migration failure
+        if: failure() && inputs.rollback_args != ''
+        run: |
+          set -eu
+          echo "::warning::Migration failed — executing rollback: ${{ inputs.rollback_args }}"
+          gcloud run jobs update "${{ inputs.job_name }}" \
+            --region "${{ inputs.region }}" \
+            --args "${{ inputs.rollback_args }}"
+          gcloud run jobs execute "${{ inputs.job_name }}" \
+            --region "${{ inputs.region }}" \
+            --wait
+          echo "::warning::Rollback executed. Deploy is halted — investigate before retrying."

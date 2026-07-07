@@ -1,0 +1,55 @@
+# EXAMPLE caller — copy into your repo as .github/workflows/cd-gcp.yml and adjust.
+# Merge-time: approved apply -> build+push -> migrate -> canary deploy.
+# Create the "production" GitHub environment with Required reviewers for the approval gate.
+name: cd-gcp
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  tf-apply:
+    uses: Yukihide-Mitsuoka/gcp-cicd-workflows/.github/workflows/tf-apply.yml@v1
+    with:
+      working_directory: infra/envs/prod
+      environment: production                       # approval gate lives here
+      wif_provider: ${{ vars.WIF_PROVIDER }}
+      service_account: ${{ vars.DEPLOYER_SA }}
+
+  build:
+    needs: tf-apply
+    uses: Yukihide-Mitsuoka/gcp-cicd-workflows/.github/workflows/container-build.yml@v1
+    with:
+      image: asia-northeast1-docker.pkg.dev/my-proj/apps/my-app
+      push: true
+      wif_provider: ${{ vars.WIF_PROVIDER }}
+      service_account: ${{ vars.DEPLOYER_SA }}
+
+  migrate:
+    needs: build
+    uses: Yukihide-Mitsuoka/gcp-cicd-workflows/.github/workflows/db-migrate.yml@v1
+    with:
+      project_id: my-proj
+      region: asia-northeast1
+      image: ${{ needs.build.outputs.image }}       # digest-pinned
+      migrate_args: "alembic,upgrade,head"
+      rollback_args: "alembic,downgrade,-1"
+      wif_provider: ${{ vars.WIF_PROVIDER }}
+      service_account: ${{ vars.DEPLOYER_SA }}
+
+  deploy:
+    needs: [build, migrate]
+    uses: Yukihide-Mitsuoka/gcp-cicd-workflows/.github/workflows/deploy-cloudrun.yml@v1
+    with:
+      project_id: my-proj
+      region: asia-northeast1
+      service: my-app
+      image: ${{ needs.build.outputs.image }}       # digest-pinned
+      canary_steps: "10,50,100"
+      health_check_url: https://canary---my-app-xxxx.a.run.app/healthz
+      wif_provider: ${{ vars.WIF_PROVIDER }}
+      service_account: ${{ vars.DEPLOYER_SA }}

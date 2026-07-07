@@ -1,0 +1,86 @@
+# gcp-cicd-workflows
+
+Reusable GitHub Actions workflows for deploying to GCP — keyless (OIDC), cached, canary,
+multi-environment. **Referenced, never copied**: callers use
+`uses: Yukihide-Mitsuoka/gcp-cicd-workflows/.github/workflows/<name>.yml@v1` and get fixes
+by tag, exactly like
+[terraform-gcp-modules](https://github.com/Yukihide-Mitsuoka/terraform-gcp-modules) does
+for infrastructure building blocks.
+
+## Position in the ecosystem
+
+| Repo | Model | Provides |
+|------|-------|----------|
+| [ai-dev-foundation](https://github.com/Yukihide-Mitsuoka/ai-dev-foundation) | copy (template) | Rules, skills, hooks, stack-agnostic CI (`make lint/test/build`) |
+| [terraform-gcp-template](https://github.com/Yukihide-Mitsuoka/terraform-gcp-template) | copy (template) | Terraform project skeleton (`infra/envs/`) |
+| [terraform-gcp-modules](https://github.com/Yukihide-Mitsuoka/terraform-gcp-modules) | reference (`?ref=vX.Y.Z`) | Terraform building blocks incl. **github-oidc** (the auth this repo consumes) |
+| **this repo** | reference (`@v1`) | The deploy pipeline itself |
+
+Style/test gates are NOT here — the foundation's `ci.yml` (`make lint`, `make test`,
+ruff/mypy/pytest via the python-uv profile) already owns them. These workflows cover only
+what needs cloud credentials or deploy orchestration.
+
+## Pipeline control flow
+
+```mermaid
+flowchart TD
+    subgraph PR["Pull request (examples/ci.yml + foundation ci.yml)"]
+        A[make lint / make test<br/>ruff · mypy · pytest · fmt] --> M{green?}
+        B[tf-plan<br/>plan → PR comment] --> M
+        C[container-build push=false<br/>cache warm] --> M
+    end
+    M -->|merge to main| D[tf-apply]
+    D -->|GitHub environment:<br/>required reviewers approve| E[container-build push=true<br/>gha layer cache → digest]
+    E --> F[db-migrate<br/>Cloud Run job --wait]
+    F -->|failure| R1[auto-rollback:<br/>rollback_args job run]
+    F -->|success| G[deploy-cloudrun<br/>new revision, 0% traffic]
+    G --> H[10% → health check<br/>50% → health check → 100%]
+    H -->|any failure| R2[rollback traffic 100%<br/>to previous revision]
+    H -->|success| Z[serving]
+```
+
+## Workflows
+
+| Workflow | Trigger side | Does |
+|----------|--------------|------|
+| [tf-plan.yml](.github/workflows/tf-plan.yml) | PR | OIDC auth → init/validate/plan → collapsed PR comment, updated in place |
+| [tf-apply.yml](.github/workflows/tf-apply.yml) | merge | Apply gated by a GitHub **environment** (required reviewers = manual approval) |
+| [container-build.yml](.github/workflows/container-build.yml) | PR (no push) / merge (push) | buildx + `type=gha` layer cache → Artifact Registry; outputs the **digest-pinned** image ref |
+| [deploy-cloudrun.yml](.github/workflows/deploy-cloudrun.yml) | merge | Canary: 0% revision → 10→50→100 with health checks; auto traffic rollback on failure |
+| [db-migrate.yml](.github/workflows/db-migrate.yml) | merge | Migration as a Cloud Run job (`--wait`); auto-runs `rollback_args` on failure |
+
+Worked callers: [examples/ci.yml](examples/ci.yml), [examples/cd.yml](examples/cd.yml).
+
+## Setup (once per consumer repo)
+
+1. Provision auth with the terraform module and record its outputs:
+   ```hcl
+   module "github_oidc" {
+     source            = "git::https://github.com/Yukihide-Mitsuoka/terraform-gcp-modules.git//modules/github-oidc?ref=v0.2.0"
+     project_id        = var.project_id
+     github_repository = "you/your-app"
+     roles             = ["roles/run.admin", "roles/artifactregistry.writer", "roles/iam.serviceAccountUser"]
+   }
+   ```
+2. Set repo **variables** `WIF_PROVIDER` / `DEPLOYER_SA` from the module outputs (they are
+   identifiers, not secrets).
+3. Create the GitHub **environment** (e.g. `production`) with Required reviewers — that is
+   the tf-apply approval gate.
+4. Copy the two example callers, adjust names, done. Caller jobs must grant
+   `permissions: id-token: write` (plus `pull-requests: write` for the plan comment).
+
+## Versioning (`@v1` floating major)
+
+GitHub-standard convention: consumers pin `@v1`; the maintainer moves `v1` forward on every
+backward-compatible release (`v1.x.y` tags also exist for exact pinning). Breaking changes
+go to `v2` — `v1` never breaks. This differs deliberately from the terraform library's
+exact-pin style (`?ref=v0.2.0`): each ecosystem follows its own convention.
+
+## Troubleshooting
+
+Error-pattern playbook for AI (and human) operators:
+[docs/troubleshooting.md](docs/troubleshooting.md).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -1,0 +1,122 @@
+# Reusable: canary deploy to Cloud Run. Deploys the new revision with zero traffic, then
+# shifts traffic in steps (default 10 -> 50 -> 100), health-checking between steps; any
+# failure rolls traffic back to the previously-serving revision.
+#
+# Caller job needs: permissions: { contents: read, id-token: write }
+name: deploy-cloudrun
+
+on:
+  workflow_call:
+    inputs:
+      project_id:
+        required: true
+        type: string
+      region:
+        required: true
+        type: string
+      service:
+        description: "Cloud Run service name (must already exist — create it via terraform)"
+        required: true
+        type: string
+      image:
+        description: "Image to deploy — use the digest-pinned output of container-build"
+        required: true
+        type: string
+      canary_steps:
+        description: "Comma-separated traffic percentages"
+        required: false
+        type: string
+        default: "10,50,100"
+      health_check_url:
+        description: "URL curl-checked between steps (e.g. the canary tag URL + /healthz). Empty = wait only"
+        required: false
+        type: string
+        default: ""
+      step_wait_seconds:
+        description: "Seconds to soak between traffic steps"
+        required: false
+        type: number
+        default: 60
+      wif_provider:
+        required: true
+        type: string
+      service_account:
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider }}
+          service_account: ${{ inputs.service_account }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ inputs.project_id }}
+
+      - name: Record currently-serving revision (rollback target)
+        id: current
+        run: |
+          set -eu
+          PREV=$(gcloud run services describe "${{ inputs.service }}" \
+            --region "${{ inputs.region }}" \
+            --format 'value(status.traffic.filter(percent>0).revisionName.list())' | tr ';' ',' | cut -d',' -f1)
+          echo "revision=${PREV}" >> "$GITHUB_OUTPUT"
+          echo "Current serving revision: ${PREV:-<none>}"
+
+      - name: Deploy new revision with zero traffic
+        id: newrev
+        run: |
+          set -eu
+          gcloud run deploy "${{ inputs.service }}" \
+            --region "${{ inputs.region }}" \
+            --image "${{ inputs.image }}" \
+            --no-traffic \
+            --tag canary
+          NEW=$(gcloud run services describe "${{ inputs.service }}" \
+            --region "${{ inputs.region }}" \
+            --format 'value(status.latestCreatedRevisionName)')
+          echo "revision=${NEW}" >> "$GITHUB_OUTPUT"
+          echo "New revision: ${NEW}"
+
+      - name: Shift traffic in canary steps with health checks
+        run: |
+          set -eu
+          NEW="${{ steps.newrev.outputs.revision }}"
+          IFS=',' read -ra STEPS <<< "${{ inputs.canary_steps }}"
+          for PCT in "${STEPS[@]}"; do
+            PCT="$(echo "$PCT" | tr -d ' ')"
+            echo "== Shifting ${PCT}% of traffic to ${NEW}"
+            gcloud run services update-traffic "${{ inputs.service }}" \
+              --region "${{ inputs.region }}" \
+              --to-revisions "${NEW}=${PCT}"
+            if [ "$PCT" != "100" ]; then
+              echo "Soaking ${{ inputs.step_wait_seconds }}s..."
+              sleep "${{ inputs.step_wait_seconds }}"
+              if [ -n "${{ inputs.health_check_url }}" ]; then
+                echo "Health check: ${{ inputs.health_check_url }}"
+                for i in 1 2 3; do
+                  curl -sf --max-time 10 "${{ inputs.health_check_url }}" > /dev/null && break
+                  [ "$i" = "3" ] && { echo "::error::Health check failed at ${PCT}% — rolling back"; exit 1; }
+                  sleep 10
+                done
+              fi
+            fi
+          done
+          echo "Canary complete: ${NEW} at 100%"
+
+      - name: Rollback on failure
+        if: failure() && steps.current.outputs.revision != ''
+        run: |
+          set -eu
+          PREV="${{ steps.current.outputs.revision }}"
+          echo "::warning::Rolling back all traffic to ${PREV}"
+          gcloud run services update-traffic "${{ inputs.service }}" \
+            --region "${{ inputs.region }}" \
+            --to-revisions "${PREV}=100"

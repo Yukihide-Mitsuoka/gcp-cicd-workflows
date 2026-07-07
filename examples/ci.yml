@@ -1,0 +1,28 @@
+# EXAMPLE caller — copy into your repo as .github/workflows/ci-gcp.yml and adjust.
+# PR-time: terraform plan + PR comment, and a no-push container build (cache warm + Dockerfile check).
+# Style gates (fmt/lint/test) belong in your own CI (ai-dev-foundation ci.yml runs make lint/test).
+name: ci-gcp
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  tf-plan:
+    uses: Yukihide-Mitsuoka/gcp-cicd-workflows/.github/workflows/tf-plan.yml@v1
+    with:
+      working_directory: infra/envs/dev
+      wif_provider: ${{ vars.WIF_PROVIDER }}       # terraform module output: workload_identity_provider
+      service_account: ${{ vars.DEPLOYER_SA }}     # terraform module output: service_account_email
+
+  container-build:
+    uses: Yukihide-Mitsuoka/gcp-cicd-workflows/.github/workflows/container-build.yml@v1
+    with:
+      image: asia-northeast1-docker.pkg.dev/my-proj/apps/my-app
+      push: false
+      wif_provider: ${{ vars.WIF_PROVIDER }}
+      service_account: ${{ vars.DEPLOYER_SA }}
