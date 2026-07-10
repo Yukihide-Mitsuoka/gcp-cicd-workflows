@@ -1,0 +1,25 @@
+# Caller example: gate compiled dbt SQL on every PR (secure-ga4-bq-template rail FR-3).
+# Copy into the consumer repo's .github/workflows/ and adjust the with: block.
+name: bq-cost-gate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  cost-gate:
+    uses: Yukihide-Mitsuoka/gcp-cicd-workflows/.github/workflows/bq-cost-gate.yml@v1
+    with:
+      sql_glob: "transform/target/compiled/**/*.sql"
+      # Runs after OIDC auth, so dbt's oauth method picks up ADC on the runner.
+      compile_command: |
+        pip install --quiet dbt-bigquery
+        cd transform && cp profiles.yml.example profiles.yml && dbt deps && dbt compile
+      project_id: my-project
+      wif_provider: projects/123456/locations/global/workloadIdentityPools/github/providers/github
+      service_account: deployer@my-project.iam.gserviceaccount.com
+      # default_max_bytes: "100000000000"          # 100 GB unless overridden
+      # budgets_file: transform/cost-budgets.yml   # overrides need a reason: field

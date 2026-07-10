@@ -48,8 +48,10 @@ flowchart TD
 | [container-build.yml](.github/workflows/container-build.yml) | PR (no push) / merge (push) | buildx + `type=gha` layer cache → Artifact Registry; outputs the **digest-pinned** image ref |
 | [deploy-cloudrun.yml](.github/workflows/deploy-cloudrun.yml) | merge | Canary: 0% revision → 10→50→100 with health checks; auto traffic rollback on failure |
 | [db-migrate.yml](.github/workflows/db-migrate.yml) | merge | Migration as a Cloud Run job (`--wait`); auto-runs `rollback_args` on failure |
+| [bq-cost-gate.yml](.github/workflows/bq-cost-gate.yml) | PR | Dry-runs compiled SQL; fails when estimated scan bytes exceed the budget (default + audited per-path overrides). Engine-independent: dbt/Dataform compile is injected by the caller |
 
-Worked callers: [examples/ci.yml](examples/ci.yml), [examples/cd.yml](examples/cd.yml).
+Worked callers: [examples/ci.yml](examples/ci.yml), [examples/cd.yml](examples/cd.yml),
+[examples/bq-cost-gate-caller.yml](examples/bq-cost-gate-caller.yml).
 
 ## Setup (once per consumer repo)
 

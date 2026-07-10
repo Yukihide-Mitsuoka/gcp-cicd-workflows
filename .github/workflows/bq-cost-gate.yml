@@ -1,0 +1,139 @@
+# Reusable: BigQuery scan-cost gate. Dry-runs every compiled SQL file and fails the
+# job when the estimated bytes exceed the model's budget — a deterministic guard, not
+# a prompt (secure-ga4-bq-template build rail FR-3).
+#
+# Engine-independent by design: dbt/Dataform compilation is injected by the caller via
+# `compile_command` (runs after OIDC auth, so ADC is available to dbt's oauth method);
+# the gate itself only ever sees SQL files. Budget overrides live in the caller's repo
+# as YAML WITH a reason per override — exceptions are declared, auditable, reviewed.
+#
+# Caller job needs: permissions: { contents: read, id-token: write }
+name: bq-cost-gate
+
+on:
+  workflow_call:
+    inputs:
+      sql_glob:
+        description: "Glob of COMPILED SQL files to gate (e.g. transform/target/compiled/**/*.sql)"
+        required: true
+        type: string
+      compile_command:
+        description: "Command producing the compiled SQL (engine-specific, e.g. dbt compile); empty if sql_glob already matches plain SQL"
+        required: false
+        type: string
+        default: ""
+      project_id:
+        description: "Project billed for the dry-run estimates"
+        required: true
+        type: string
+      wif_provider:
+        description: "Workload Identity provider resource name (module output workload_identity_provider)"
+        required: true
+        type: string
+      service_account:
+        description: "SA email used for the dry-runs (read metadata only; dry-run scans nothing)"
+        required: true
+        type: string
+      default_max_bytes:
+        description: "Per-model budget in bytes when no override matches (default 100 GB — tune per engagement)"
+        required: false
+        type: string
+        default: "100000000000"
+      budgets_file:
+        description: "Path to a YAML file: overrides: { '<path glob>': { max_bytes: N, reason: '...' } }"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider }}
+          service_account: ${{ inputs.service_account }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Compile SQL (engine-specific, caller-provided)
+        if: inputs.compile_command != ''
+        run: ${{ inputs.compile_command }}
+
+      - name: Dry-run every model against its budget
+        env:
+          SQL_GLOB: ${{ inputs.sql_glob }}
+          PROJECT_ID: ${{ inputs.project_id }}
+          DEFAULT_MAX_BYTES: ${{ inputs.default_max_bytes }}
+          BUDGETS_FILE: ${{ inputs.budgets_file }}
+        run: |
+          python3 - <<'PYEOF'
+          import fnmatch, glob, json, os, re, subprocess, sys
+
+          sql_glob = os.environ["SQL_GLOB"]
+          project = os.environ["PROJECT_ID"]
+          default_max = int(os.environ["DEFAULT_MAX_BYTES"])
+          budgets_file = os.environ.get("BUDGETS_FILE", "")
+
+          overrides = {}
+          if budgets_file:
+              import yaml  # PyYAML ships on ubuntu runners
+              with open(budgets_file, encoding="utf-8") as f:
+                  overrides = (yaml.safe_load(f) or {}).get("overrides", {}) or {}
+
+          files = sorted(glob.glob(sql_glob, recursive=True))
+          if not files:
+              print(f"::error::no SQL files match {sql_glob} (did compile_command run?)")
+              sys.exit(1)
+
+          def budget_for(path):
+              for pattern, spec in overrides.items():
+                  if fnmatch.fnmatch(path, pattern):
+                      return int(spec["max_bytes"]), spec.get("reason", "")
+              return default_max, ""
+
+          def dry_run_bytes(path):
+              with open(path, encoding="utf-8") as f:
+                  sql = f.read()
+              proc = subprocess.run(
+                  ["bq", f"--project_id={project}", "query",
+                   "--use_legacy_sql=false", "--dry_run", "--format=json"],
+                  input=sql, capture_output=True, text=True)
+              try:
+                  data = json.loads(proc.stdout)
+                  return int(data["statistics"]["query"]["totalBytesProcessed"]), None
+              except (ValueError, KeyError, TypeError):
+                  m = re.search(r"process (\d+) bytes", proc.stdout + proc.stderr)
+                  if m:
+                      return int(m.group(1)), None
+                  return None, (proc.stdout + proc.stderr).strip()[:500]
+
+          rows, failed = [], False
+          for path in files:
+              limit, reason = budget_for(path)
+              nbytes, err = dry_run_bytes(path)
+              if err is not None:
+                  failed = True
+                  rows.append((path, "dry-run error", f"{limit:,}", "FAIL", err.replace("|", "\\|")))
+                  continue
+              ok = nbytes <= limit
+              failed = failed or not ok
+              rows.append((path, f"{nbytes:,}", f"{limit:,}", "OK" if ok else "OVER BUDGET", reason))
+
+          lines = ["## BigQuery cost gate", "",
+                   "| file | estimated bytes | budget | result | override reason |",
+                   "|---|---|---|---|---|"]
+          lines += ["| " + " | ".join(str(c) for c in r) + " |" for r in rows]
+          report = "\n".join(lines)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write(report + "\n")
+          print(report)
+          if failed:
+              print("::error::cost gate failed — raise the budget via budgets_file WITH a reason, or fix partitioning/clustering")
+              sys.exit(1)
+          PYEOF
