@@ -1,0 +1,100 @@
+# Reusable: on-demand, read-only BigQuery governance inspection. Runs the CALLER repo's
+# FR-4 inspection engine (secure-ga4-bq-template `src/modules/inspection`, canonical entry
+# `make inspect`) against a live project and publishes the deterministic 11-checkpoint
+# report. It never mutates anything — the inspector SA carries a read-only custom role
+# (FR-6); a dry-run/setCategory is impossible on this path by construction.
+#
+# Keyless auth (OIDC/WIF). Unlike bq-cost-gate this needs NO setup-gcloud: the engine
+# reaches GCP through google-api-python-client (googleapiclient discovery) via
+# google-auth's google.auth.default(), which reads the Application Default Credentials
+# that google-github-actions/auth@v2 writes to the runner
+# (GOOGLE_APPLICATION_CREDENTIALS -> external_account/WIF config). No `bq`/`gcloud` CLI.
+#
+# Report is surfaced two ways (FR-5): the Markdown summary is appended to the job summary,
+# and the full reports tree (findings.json + summary.md) is uploaded as an artifact.
+# Gating is opt-in: findings never fail the run by default (report-and-attach IS the
+# delivery model, FR-5) — set `fail_on` to gate CI on a severity floor.
+#
+# Caller job needs: permissions: { contents: read, id-token: write }
+name: bq-inspect
+
+on:
+  workflow_call:
+    inputs:
+      wif_provider:
+        description: "Workload Identity provider resource name (module output workload_identity_provider)"
+        required: true
+        type: string
+      service_account:
+        description: "INSPECTOR SA email — read-only custom role (FR-6). NOT the deployer SA"
+        required: true
+        type: string
+      params_file:
+        description: "Engagement parameters YAML (FR-7); passed to `make inspect PARAMS=`"
+        required: false
+        type: string
+        default: "inspection-params.yml"
+      out_dir:
+        description: "Report root written under the caller checkout"
+        required: false
+        type: string
+        default: "reports"
+      fail_on:
+        description: "Severity floor that fails the run (HIGH|MEDIUM|LOW|INFO). Empty = report only, never fail"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider }}
+          service_account: ${{ inputs.service_account }}
+
+      # The engine is uv-managed; runners ship neither uv nor the deps (mirror the
+      # asset template's own CI, which drives every stack through canonical make targets).
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install toolchain
+        run: make setup
+
+      - name: Run FR-4 inspection (read-only)
+        # Inputs pass through env, never inlined into the shell — blocks script injection
+        # from an operator-supplied fail_on and matches bq-cost-gate.yml. Empty FAIL_ON is
+        # a no-op in the Makefile ($(if $(FAIL_ON),...)) — report-only.
+        env:
+          PARAMS_FILE: ${{ inputs.params_file }}
+          OUT_DIR: ${{ inputs.out_dir }}
+          FAIL_ON: ${{ inputs.fail_on }}
+        run: |
+          make inspect PARAMS="$PARAMS_FILE" OUT="$OUT_DIR" FAIL_ON="$FAIL_ON"
+
+      - name: Append report to job summary
+        if: always()
+        env:
+          OUT_DIR: ${{ inputs.out_dir }}
+        run: |
+          # Report path is <out>/<project_id>/<timestamp>/summary.md; the timestamp is
+          # lexically sortable (…YYYYMMDDTHHMMSSZ) so the last path is the newest run.
+          latest="$(find "$OUT_DIR" -name summary.md 2>/dev/null | sort | tail -n1)"
+          if [ -n "$latest" ]; then
+            cat "$latest" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No inspection report was produced — the engine failed before writing (see the run step log)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload full report (findings.json + summary.md)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bq-inspection-report
+          path: ${{ inputs.out_dir }}/
+          if-no-files-found: warn
