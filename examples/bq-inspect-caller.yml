@@ -1,0 +1,30 @@
+# Caller example: on-demand + scheduled read-only governance inspection
+# (secure-ga4-bq-template inspection engine — FR-4 checks, FR-5 report, FR-6 least-priv SA).
+# Copy into the consumer repo's .github/workflows/ and adjust the with: block.
+# Uses the INSPECTOR SA (read-only custom role) — never the deployer SA.
+name: bq-inspect
+
+on:
+  workflow_dispatch:
+    inputs:
+      fail_on:
+        description: "Optional severity floor to fail on; leave empty to only report (FR-5 default)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "17 3 * * 1" # weekly, Monday 03:17 UTC — off the top-of-hour runner stampede
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  inspect:
+    uses: Yukihide-Mitsuoka/gcp-cicd-workflows/.github/workflows/bq-inspect.yml@v1
+    with:
+      wif_provider: ${{ vars.WIF_PROVIDER }}         # terraform module output: workload_identity_provider
+      service_account: ${{ vars.INSPECTOR_SA }}      # read-only inspector SA (FR-6) — NOT the deployer
+      params_file: inspection-params.yml
+      # Empty on schedule; the dispatch form lets an operator gate a manual run.
+      # Report-and-attach is the default delivery model — no gate unless you ask for one.
+      fail_on: ${{ inputs.fail_on }}
