@@ -1,11 +1,13 @@
 # Reusable: BigQuery scan-cost gate. Dry-runs every compiled SQL file and fails the
-# job when the estimated bytes exceed the model's budget — a deterministic guard, not
-# a prompt (secure-ga4-bq-template build rail FR-3).
+# job when the estimated bytes exceed the model's budget. It never runs a query.
+#
+# Security boundary (ADR-0001): caller-controlled compilation runs in a separate job
+# with no OIDC permission or cloud authentication. Only regular SQL files contained by
+# the checkout cross into the WIF-authenticated gate job through an immutable artifact.
 #
 # Engine-independent by design: dbt/Dataform compilation is injected by the caller via
-# `compile_command` (runs after OIDC auth, so ADC is available to dbt's oauth method);
-# the gate itself only ever sees SQL files. Budget overrides live in the caller's repo
-# as YAML WITH a reason per override — exceptions are declared, auditable, reviewed.
+# `compile_command`. The command MUST be credential-free. Budget overrides live in the
+# caller repository as YAML with a non-empty reason for every override.
 #
 # Caller job needs: permissions: { contents: read, id-token: write }
 name: bq-cost-gate
@@ -14,11 +16,11 @@ on:
   workflow_call:
     inputs:
       sql_glob:
-        description: "Glob of COMPILED SQL files to gate (e.g. transform/target/compiled/**/*.sql)"
+        description: "Glob of compiled SQL files to gate (for example transform/target/compiled/**/*.sql)"
         required: true
         type: string
       compile_command:
-        description: "Command producing the compiled SQL (engine-specific, e.g. dbt compile); empty if sql_glob already matches plain SQL"
+        description: "Credential-free command that produces compiled SQL; empty when sql_glob already matches SQL"
         required: false
         type: string
         default: ""
@@ -27,32 +29,114 @@ on:
         required: true
         type: string
       wif_provider:
-        description: "Workload Identity provider resource name (module output workload_identity_provider)"
+        description: "Workload Identity provider resource name"
         required: true
         type: string
       service_account:
-        description: "SA email used for the dry-runs (read metadata only; dry-run scans nothing)"
+        description: "Least-privilege service account used only for BigQuery dry runs"
         required: true
         type: string
       default_max_bytes:
-        description: "Per-model budget in bytes when no override matches (default 100 GB — tune per engagement)"
+        description: "Per-model budget in bytes when no override matches"
         required: false
         type: string
         default: "100000000000"
       budgets_file:
-        description: "Path to a YAML file: overrides: { '<path glob>': { max_bytes: N, reason: '...' } }"
+        description: "YAML path: overrides: { '<path glob>': { max_bytes: N, reason: '...' } }"
         required: false
         type: string
         default: ""
 
 jobs:
+  compile:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Compile SQL without cloud credentials
+        if: inputs.compile_command != ''
+        env:
+          COMPILE_COMMAND: ${{ inputs.compile_command }}
+        run: bash --noprofile --norc -eu -o pipefail -c "$COMPILE_COMMAND"
+
+      - name: Stage regular SQL files from the checkout
+        env:
+          SQL_GLOB: ${{ inputs.sql_glob }}
+        run: |
+          python3 - <<'PYEOF'
+          import glob
+          import os
+          import shutil
+          from pathlib import Path
+
+          root = Path.cwd().resolve()
+          stage = root / ".bq-cost-gate-input"
+          shutil.rmtree(stage, ignore_errors=True)
+
+          def stop(message):
+              print(f"::error::{message}")
+              raise SystemExit(1)
+
+          matches = sorted(glob.glob(os.environ["SQL_GLOB"], recursive=True))
+          if not matches:
+              stop(f"no SQL files match {os.environ['SQL_GLOB']} (did compile_command run?)")
+
+          staged = 0
+          for raw_path in matches:
+              candidate = Path(raw_path)
+              if candidate.is_absolute():
+                  stop(f"SQL path must be relative to the checkout: {raw_path}")
+              lexical = Path(os.path.abspath(root / candidate))
+              try:
+                  relative = lexical.relative_to(root)
+              except ValueError:
+                  stop(f"SQL path escapes the checkout: {raw_path}")
+
+              cursor = root
+              for part in relative.parts:
+                  cursor /= part
+                  if cursor.is_symlink():
+                      stop(f"SQL path contains a symlink: {raw_path}")
+
+              if not lexical.is_file() or lexical.suffix.lower() != ".sql":
+                  stop(f"SQL glob matched a non-SQL regular file: {raw_path}")
+
+              destination = stage / relative
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(lexical, destination, follow_symlinks=False)
+              staged += 1
+
+          print(f"staged {staged} SQL file(s) without cloud credentials")
+          PYEOF
+
+      - name: Upload isolated SQL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bq-cost-gate-sql
+          path: .bq-cost-gate-input/
+          if-no-files-found: error
+          retention-days: 1
+
   gate:
+    needs: compile
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download isolated SQL artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bq-cost-gate-sql
+          path: .bq-cost-gate-input
 
       - uses: google-github-actions/auth@v2
         with:
@@ -61,79 +145,121 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Compile SQL (engine-specific, caller-provided)
-        if: inputs.compile_command != ''
-        run: ${{ inputs.compile_command }}
-
       - name: Dry-run every model against its budget
         env:
-          SQL_GLOB: ${{ inputs.sql_glob }}
           PROJECT_ID: ${{ inputs.project_id }}
           DEFAULT_MAX_BYTES: ${{ inputs.default_max_bytes }}
           BUDGETS_FILE: ${{ inputs.budgets_file }}
         run: |
           python3 - <<'PYEOF'
-          import fnmatch, glob, json, os, re, subprocess, sys
+          import fnmatch
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
 
-          sql_glob = os.environ["SQL_GLOB"]
+          checkout = Path.cwd().resolve()
+          sql_root = (checkout / ".bq-cost-gate-input").resolve()
           project = os.environ["PROJECT_ID"]
           default_max = int(os.environ["DEFAULT_MAX_BYTES"])
           budgets_file = os.environ.get("BUDGETS_FILE", "")
 
+          def stop(message):
+              print(f"::error::{message}")
+              raise SystemExit(1)
+
+          if default_max < 0:
+              stop("default_max_bytes must be non-negative")
+
           overrides = {}
           if budgets_file:
-              import yaml  # PyYAML ships on ubuntu runners
-              with open(budgets_file, encoding="utf-8") as f:
-                  overrides = (yaml.safe_load(f) or {}).get("overrides", {}) or {}
+              import yaml
 
-          files = sorted(glob.glob(sql_glob, recursive=True))
+              budget_candidate = Path(budgets_file)
+              if budget_candidate.is_absolute():
+                  stop("budgets_file must be relative to the checkout")
+              budget_path = (checkout / budget_candidate).resolve()
+              try:
+                  budget_path.relative_to(checkout)
+              except ValueError:
+                  stop("budgets_file escapes the checkout")
+              if budget_path.is_symlink() or not budget_path.is_file():
+                  stop("budgets_file must be a regular non-symlink file")
+              loaded = yaml.safe_load(budget_path.read_text(encoding="utf-8")) or {}
+              overrides = loaded.get("overrides", {}) or {}
+              if not isinstance(overrides, dict):
+                  stop("budgets_file overrides must be a mapping")
+              for pattern, spec in overrides.items():
+                  if not isinstance(pattern, str) or not isinstance(spec, dict):
+                      stop("each budget override must map a path glob to an object")
+                  if int(spec.get("max_bytes", -1)) < 0:
+                      stop(f"budget override {pattern} needs non-negative max_bytes")
+                  if not isinstance(spec.get("reason"), str) or not spec["reason"].strip():
+                      stop(f"budget override {pattern} needs a non-empty reason")
+
+          files = sorted(path for path in sql_root.rglob("*.sql") if path.is_file())
           if not files:
-              print(f"::error::no SQL files match {sql_glob} (did compile_command run?)")
-              sys.exit(1)
+              stop("isolated compile artifact contains no SQL files")
+
+          def display_path(path):
+              if path.is_symlink():
+                  stop(f"isolated artifact contains a symlink: {path}")
+              resolved = path.resolve()
+              try:
+                  return resolved.relative_to(sql_root).as_posix()
+              except ValueError:
+                  stop(f"isolated SQL path escapes its artifact root: {path}")
 
           def budget_for(path):
               for pattern, spec in overrides.items():
                   if fnmatch.fnmatch(path, pattern):
-                      return int(spec["max_bytes"]), spec.get("reason", "")
+                      return int(spec["max_bytes"]), spec["reason"]
               return default_max, ""
 
           def dry_run_bytes(path):
-              with open(path, encoding="utf-8") as f:
-                  sql = f.read()
+              sql = path.read_text(encoding="utf-8")
               proc = subprocess.run(
-                  ["bq", f"--project_id={project}", "query",
-                   "--use_legacy_sql=false", "--dry_run", "--format=json"],
-                  input=sql, capture_output=True, text=True)
+                  ["bq", f"--project_id={project}", "query", "--use_legacy_sql=false",
+                   "--dry_run", "--format=json"],
+                  input=sql, capture_output=True, text=True, check=False)
               try:
                   data = json.loads(proc.stdout)
                   return int(data["statistics"]["query"]["totalBytesProcessed"]), None
               except (ValueError, KeyError, TypeError):
-                  m = re.search(r"process (\d+) bytes", proc.stdout + proc.stderr)
-                  if m:
-                      return int(m.group(1)), None
+                  match = re.search(r"process (\d+) bytes", proc.stdout + proc.stderr)
+                  if match:
+                      return int(match.group(1)), None
                   return None, (proc.stdout + proc.stderr).strip()[:500]
 
-          rows, failed = [], False
-          for path in files:
+          def cell(value):
+              return str(value).replace("|", "\\|").replace("\n", " ")
+
+          rows = []
+          failed = False
+          for sql_path in files:
+              path = display_path(sql_path)
               limit, reason = budget_for(path)
-              nbytes, err = dry_run_bytes(path)
-              if err is not None:
+              nbytes, error = dry_run_bytes(sql_path)
+              if error is not None:
                   failed = True
-                  rows.append((path, "dry-run error", f"{limit:,}", "FAIL", err.replace("|", "\\|")))
+                  rows.append((path, "dry-run error", f"{limit:,}", "FAIL", error))
                   continue
               ok = nbytes <= limit
               failed = failed or not ok
-              rows.append((path, f"{nbytes:,}", f"{limit:,}", "OK" if ok else "OVER BUDGET", reason))
+              rows.append((path, f"{nbytes:,}", f"{limit:,}",
+                           "OK" if ok else "OVER BUDGET", reason))
 
           lines = ["## BigQuery cost gate", "",
                    "| file | estimated bytes | budget | result | override reason |",
                    "|---|---|---|---|---|"]
-          lines += ["| " + " | ".join(str(c) for c in r) + " |" for r in rows]
+          lines += ["| " + " | ".join(cell(column) for column in row) + " |" for row in rows]
           report = "\n".join(lines)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-              f.write(report + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(report + "\n")
           print(report)
           if failed:
-              print("::error::cost gate failed — raise the budget via budgets_file WITH a reason, or fix partitioning/clustering")
+              print("::error::cost gate failed; fix the model or add a reviewed budget override")
               sys.exit(1)
           PYEOF
