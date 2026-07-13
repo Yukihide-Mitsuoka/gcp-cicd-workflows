@@ -49,7 +49,7 @@ flowchart TD
 | [deploy-cloudrun.yml](.github/workflows/deploy-cloudrun.yml) | merge | Canary: 0% revision → 10→50→100 with health checks; auto traffic rollback on failure |
 | [db-migrate.yml](.github/workflows/db-migrate.yml) | merge | Migration as a Cloud Run job (`--wait`); auto-runs `rollback_args` on failure |
 | [bq-cost-gate.yml](.github/workflows/bq-cost-gate.yml) | PR | Dry-runs compiled SQL; fails when estimated scan bytes exceed the budget (default + audited per-path overrides). Engine-independent: dbt/Dataform compile is injected by the caller |
-| [bq-inspect.yml](.github/workflows/bq-inspect.yml) | on-demand / schedule | Runs the caller's read-only FR-4 inspection engine (11 deterministic governance checkpoints) with the **inspector SA**; appends `summary.md` to the job summary and uploads `findings.json` + `summary.md` as an artifact. Report-only by default; opt-in `fail_on` gates CI |
+| [bq-inspect.yml](.github/workflows/bq-inspect.yml) | on-demand / schedule | Runs the caller's read-only FR-4 inspection engine (11 deterministic governance checkpoints) with the **inspector SA**; appends `summary.md` to the job summary and uploads `findings.json` + `summary.md` + deterministic `remediation-draft.md` as an artifact. Report-only by default; opt-in `fail_on` gates CI |
 
 Worked callers: [examples/ci.yml](examples/ci.yml), [examples/cd.yml](examples/cd.yml),
 [examples/bq-cost-gate-caller.yml](examples/bq-cost-gate-caller.yml),

@@ -1,4 +1,5 @@
-# Caller example: on-demand + scheduled read-only governance inspection
+# Caller example: on-demand + scheduled read-only governance inspection with a
+# deterministic, non-applying remediation draft in the uploaded report artifact.
 # (secure-ga4-bq-template inspection engine — FR-4 checks, FR-5 report, FR-6 least-priv SA).
 # Copy into the consumer repo's .github/workflows/ and adjust the with: block.
 # Uses the INSPECTOR SA (read-only custom role) — never the deployer SA.
