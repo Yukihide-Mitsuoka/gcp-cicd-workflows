@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Security boundary regression tests
+        run: python3 scripts/test_bq_cost_gate_security.py
+
       - name: actionlint
         uses: docker://rhysd/actionlint:1.7.7
         with:
