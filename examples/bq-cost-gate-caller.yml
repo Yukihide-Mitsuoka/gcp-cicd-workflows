@@ -11,15 +11,14 @@ permissions:
 
 jobs:
   cost-gate:
-    uses: Yukihide-Mitsuoka/gcp-cicd-workflows/.github/workflows/bq-cost-gate.yml@v1
+    uses: Yukihide-Mitsuoka/gcp-cicd-workflows/.github/workflows/bq-cost-gate.yml@v2
     with:
       sql_glob: "transform/target/compiled/**/*.sql"
-      # Runs after OIDC auth, so dbt's oauth method picks up ADC on the runner.
-      compile_command: |
-        pip install --quiet dbt-bigquery
-        cd transform && cp profiles.yml.example profiles.yml && dbt deps && dbt compile
-      project_id: my-project
-      wif_provider: projects/123456/locations/global/workloadIdentityPools/github/providers/github
-      service_account: deployer@my-project.iam.gserviceaccount.com
+      # Checked-in target; MUST compile without ADC, secrets, or runtime installs.
+      compile_command: make compile-cost-gate
+      project_id: ${{ vars.GCP_PROJECT_ID }}
+      wif_provider: ${{ vars.WIF_PROVIDER }}
+      # Dedicated dry-run identity; never pass DEPLOYER_SA.
+      service_account: ${{ vars.COST_GATE_SA }}
       # default_max_bytes: "100000000000"          # 100 GB unless overridden
       # budgets_file: transform/cost-budgets.yml   # overrides need a reason: field

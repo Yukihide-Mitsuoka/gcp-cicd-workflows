@@ -53,10 +53,27 @@ one exists — search for the message you see. Each entry: cause → check → f
 **Check:** the image ref is the digest output of container-build (not a tag that was never pushed — PR builds use `push: false`); region of Artifact Registry matches.
 **Fix:** ensure CD calls container-build with `push: true` and passes `needs.build.outputs.image` (digest-pinned).
 
-## `Error: workflow was not found` when calling `@v1`
+## `Error: workflow was not found` when calling a floating major
 
 **Cause:** consumer repo cannot see this repo (private) or the tag doesn't exist yet.
-**Fix:** this repo is public — check the path spelling (`.github/workflows/<name>.yml`) and that `v1` exists (`git ls-remote --tags`).
+**Fix:** this repo is public — check the path spelling and that the workflow's documented
+major (`v1` or `v2`) exists with `git ls-remote --tags`.
+
+## `no SQL files match ... (did compile_command run?)`
+
+**Cause:** the v2 cost-gate compile job did not produce files matching `sql_glob`, or
+the command failed because it expected ADC. Compilation intentionally has no cloud
+credentials (ADR-0001).
+**Check:** run the exact `compile_command` in a credential-free clean checkout and inspect
+the generated paths.
+**Fix:** make compilation offline and update `sql_glob`. Do not move authentication back
+into compilation and do not pass `DEPLOYER_SA`.
+
+## `budget override ... needs a non-empty reason`
+
+**Cause:** a per-path budget exception lacks its required audit rationale.
+**Fix:** add a concise `reason` explaining why the larger scan is accepted, or remove the
+override and reduce the model's estimated bytes.
 
 ## Rules for the responding AI
 
