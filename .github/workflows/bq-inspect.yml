@@ -11,7 +11,9 @@
 # (GOOGLE_APPLICATION_CREDENTIALS -> external_account/WIF config). No `bq`/`gcloud` CLI.
 #
 # Report is surfaced two ways (FR-5): the Markdown summary is appended to the job summary,
-# and the full reports tree (findings.json + summary.md) is uploaded as an artifact.
+# and the full reports tree (findings.json + summary.md + remediation-draft.md) is uploaded
+# as an artifact. The remediation draft is rendered locally from deterministic recipes;
+# this workflow never calls an AI provider or applies a change.
 # Gating is opt-in: findings never fail the run by default (report-and-attach IS the
 # delivery model, FR-5) — set `fail_on` to gate CI on a severity floor.
 #
@@ -77,6 +79,18 @@ jobs:
         run: |
           make inspect PARAMS="$PARAMS_FILE" OUT="$OUT_DIR" FAIL_ON="$FAIL_ON"
 
+      - name: Render deterministic remediation draft
+        if: always()
+        env:
+          OUT_DIR: ${{ inputs.out_dir }}
+        run: |
+          findings="$(find "$OUT_DIR" -name findings.json 2>/dev/null | sort | tail -n1)"
+          if [ -z "$findings" ]; then
+            echo "No findings artifact exists; skipping the remediation draft."
+            exit 0
+          fi
+          make remediation-draft FINDINGS="$findings" OUT="$(dirname "$findings")"
+
       - name: Append report to job summary
         if: always()
         env:
@@ -91,7 +105,7 @@ jobs:
             echo "No inspection report was produced — the engine failed before writing (see the run step log)." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Upload full report (findings.json + summary.md)
+      - name: Upload full report and remediation draft
         if: always()
         uses: actions/upload-artifact@v4
         with:
