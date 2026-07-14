@@ -118,6 +118,7 @@ jobs:
         with:
           name: bq-cost-gate-sql
           path: .bq-cost-gate-input/
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
 

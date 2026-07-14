@@ -69,6 +69,12 @@ the generated paths.
 **Fix:** make compilation offline and update `sql_glob`. Do not move authentication back
 into compilation and do not pass `DEPLOYER_SA`.
 
+## `No files were found with the provided path: .bq-cost-gate-input/`
+
+**Cause:** `actions/upload-artifact` excluded the hidden SQL staging directory. This was
+fixed in the reusable workflow after v2.0.0.
+**Fix:** upgrade the reusable cost-gate workflow to the latest v2 release.
+
 ## `budget override ... needs a non-empty reason`
 
 **Cause:** a per-path budget exception lacks its required audit rationale.
