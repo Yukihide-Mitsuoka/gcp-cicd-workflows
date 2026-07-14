@@ -85,4 +85,18 @@ for step in gate_steps:
     if isinstance(command, str) and "inputs.compile_command" in command:
         fail("credentialed gate job must never evaluate compile_command")
 
+dry_run_commands = [
+    step.get("run", "")
+    for step in gate_steps
+    if isinstance(step.get("run", ""), str)
+    and "def dry_run_bytes" in step.get("run", "")
+]
+if len(dry_run_commands) != 1:
+    fail("gate job must define exactly one BigQuery dry-run parser")
+dry_run_command = dry_run_commands[0]
+if "json.JSONDecoder().raw_decode" not in dry_run_command:
+    fail("dry-run parser must tolerate warning text around the BigQuery job JSON")
+if "for output in (proc.stdout, proc.stderr)" not in dry_run_command:
+    fail("dry-run parser must inspect both command output streams")
+
 print("bq-cost-gate WIF boundary: OK")
