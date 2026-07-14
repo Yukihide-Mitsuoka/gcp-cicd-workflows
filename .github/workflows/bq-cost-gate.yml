@@ -219,20 +219,33 @@ jobs:
                       return int(spec["max_bytes"]), spec["reason"]
               return default_max, ""
 
+          def parse_job_json(output):
+              cursor = 0
+              while True:
+                  start = output.find("{", cursor)
+                  if start < 0:
+                      return None
+                  try:
+                      data, _consumed = json.JSONDecoder().raw_decode(output[start:])
+                      int(data["statistics"]["query"]["totalBytesProcessed"])
+                      return data
+                  except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                      cursor = start + 1
+
           def dry_run_bytes(path):
               sql = path.read_text(encoding="utf-8")
               proc = subprocess.run(
                   ["bq", f"--project_id={project}", "query", "--use_legacy_sql=false",
                    "--dry_run", "--format=json"],
                   input=sql, capture_output=True, text=True, check=False)
-              try:
-                  data = json.loads(proc.stdout)
-                  return int(data["statistics"]["query"]["totalBytesProcessed"]), None
-              except (ValueError, KeyError, TypeError):
-                  match = re.search(r"process (\d+) bytes", proc.stdout + proc.stderr)
-                  if match:
-                      return int(match.group(1)), None
-                  return None, (proc.stdout + proc.stderr).strip()[:500]
+              for output in (proc.stdout, proc.stderr):
+                  data = parse_job_json(output)
+                  if data is not None:
+                      return int(data["statistics"]["query"]["totalBytesProcessed"]), None
+              match = re.search(r"process (\d+) bytes", proc.stdout + proc.stderr)
+              if match:
+                  return int(match.group(1)), None
+              return None, (proc.stdout + proc.stderr).strip()[:500]
 
           def cell(value):
               return str(value).replace("|", "\\|").replace("\n", " ")

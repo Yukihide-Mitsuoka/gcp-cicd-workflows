@@ -75,6 +75,12 @@ into compilation and do not pass `DEPLOYER_SA`.
 fixed in the reusable workflow after v2.0.0.
 **Fix:** upgrade the reusable cost-gate workflow to the latest v2 release.
 
+## `dry-run error ... WARNING: --scopes flag may not work as expected`
+
+**Cause:** older cost-gate releases treated the WIF external-account warning around a
+successful `bq --format=json` response as malformed JSON.
+**Fix:** upgrade the reusable cost-gate workflow to the latest v2 release.
+
 ## `budget override ... needs a non-empty reason`
 
 **Cause:** a per-path budget exception lacks its required audit rationale.
