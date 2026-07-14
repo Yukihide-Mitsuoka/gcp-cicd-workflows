@@ -10,6 +10,7 @@ import yaml
 WORKFLOW = Path(__file__).parents[1] / ".github/workflows/bq-cost-gate.yml"
 AUTH_ACTION = "google-github-actions/auth@"
 GCLOUD_ACTION = "google-github-actions/setup-gcloud@"
+UPLOAD_ACTION = "actions/upload-artifact@"
 
 
 def fail(message: str) -> None:
@@ -50,6 +51,13 @@ if any(uses_action(step, AUTH_ACTION) for step in compile_steps):
     fail("compile job must not authenticate to Google Cloud")
 if any(uses_action(step, GCLOUD_ACTION) for step in compile_steps):
     fail("compile job must not install authenticated cloud tooling")
+
+upload_steps = [step for step in compile_steps if uses_action(step, UPLOAD_ACTION)]
+if len(upload_steps) != 1:
+    fail("compile job must upload exactly one isolated SQL artifact")
+upload_inputs = upload_steps[0].get("with", {})
+if not isinstance(upload_inputs, dict) or upload_inputs.get("include-hidden-files") is not True:
+    fail("isolated hidden SQL staging tree must be included in the artifact")
 
 gate_permissions = gate_job.get("permissions", {})
 if gate_permissions.get("id-token") != "write":
